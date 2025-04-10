@@ -52,7 +52,26 @@ class MakeCrudCommand extends Command
     $fields = [];
     foreach (explode(',', $fieldsString) as $field) {
       $parts = explode(':', $field);
-      $fields[trim($parts[0])] = trim($parts[1]);
+
+      // Skip malformed field definitions
+      if (count($parts) !== 2) {
+        $this->warn("Skipping malformed field definition: {$field}");
+        continue;
+      }
+
+      $fieldName = trim($parts[0]);
+      $fieldType = trim($parts[1]);
+
+      // Handle enum fields with options
+      if (strpos($fieldType, 'enum(') === 0) {
+        $options = substr($fieldType, 5, -1); // Remove enum( and )
+        $fields[$fieldName] = [
+          'type' => 'enum',
+          'options' => explode(',', $options)
+        ];
+      } else {
+        $fields[$fieldName] = $fieldType;
+      }
     }
 
     return $fields;
@@ -128,10 +147,9 @@ PHP;
     $fieldsCode = '';
 
     foreach ($fields as $field => $type) {
-      if (str_contains($type, 'enum')) {
-        preg_match('/enum\((.*)\)/', $type, $matches);
-        $options = $matches[1];
-        $fieldsCode .= "\$table->enum('{$field}', [{$options}]);\n            ";
+      if (is_array($type) && $type['type'] === 'enum') {
+        $options = implode("', '", $type['options']);
+        $fieldsCode .= "\$table->enum('{$field}', ['{$options}']);\n            ";
       } else {
         $fieldsCode .= "\$table->{$type}('{$field}');\n            ";
       }
@@ -251,9 +269,9 @@ PHP;
 
   protected function getValidationRule($type)
   {
-    if (str_contains($type, 'enum')) {
-      preg_match('/enum\((.*)\)/', $type, $matches);
-      return 'in:' . $matches[1];
+    if (is_array($type) && $type['type'] === 'enum') {
+      $options = implode(',', $type['options']);
+      return 'in:' . $options;
     }
 
     switch ($type) {
@@ -273,24 +291,28 @@ PHP;
   protected function generateViews($modelName, $fields)
   {
     $viewsPath = resource_path("views/{$modelName}");
-    File::makeDirectory($viewsPath, 0755, true);
+
+    // Check if directory exists before creating it
+    if (!File::exists($viewsPath)) {
+      File::makeDirectory($viewsPath, 0755, true);
+    }
 
     // Generate index view
-    $this->generateIndexView($modelName, $fields);
+    $this->generateIndexView($modelName, $fields, $viewsPath);
 
     // Generate create view
-    $this->generateCreateView($modelName, $fields);
+    $this->generateCreateView($modelName, $fields, $viewsPath);
 
     // Generate edit view
-    $this->generateEditView($modelName, $fields);
+    $this->generateEditView($modelName, $fields, $viewsPath);
 
     // Generate show view
-    $this->generateShowView($modelName, $fields);
+    $this->generateShowView($modelName, $fields, $viewsPath);
 
     $this->info("Views created successfully.");
   }
 
-  protected function generateIndexView($modelName, $fields)
+  protected function generateIndexView($modelName, $fields, $viewsPath)
   {
     $fieldsList = '';
     foreach ($fields as $field => $type) {
@@ -337,11 +359,11 @@ PHP;
     File::put("{$viewsPath}/index.blade.php", $content);
   }
 
-  protected function generateCreateView($modelName, $fields)
+  protected function generateCreateView($modelName, $fields, $viewsPath)
   {
     $formFields = '';
     foreach ($fields as $field => $type) {
-      $formFields .= $this->generateFormField($field, $type);
+      $formFields .= $this->generateFormField($field, $type, $modelName);
     }
 
     $content = <<<PHP
@@ -365,17 +387,17 @@ PHP;
     File::put("{$viewsPath}/create.blade.php", $content);
   }
 
-  protected function generateFormField($field, $type)
+  protected function generateFormField($field, $type, $modelName, $isEdit = false)
   {
     $label = ucfirst(str_replace('_', ' ', $field));
+    $value = $isEdit ? "{{ \${$modelName}->{$field} }}" : '';
 
-    if (str_contains($type, 'enum')) {
-      preg_match('/enum\((.*)\)/', $type, $matches);
-      $options = explode(',', $matches[1]);
+    if (is_array($type) && $type['type'] === 'enum') {
       $optionsHtml = '';
-      foreach ($options as $option) {
-        $option = trim($option, "' ");
-        $optionsHtml .= "<option value=\"{$option}\">{$option}</option>\n                    ";
+      foreach ($type['options'] as $option) {
+        $option = trim($option);
+        $selected = $isEdit ? "{{ \${$modelName}->{$field} == '{$option}' ? 'selected' : '' }}" : '';
+        $optionsHtml .= "<option value=\"{$option}\" {$selected}>{$option}</option>\n                    ";
       }
 
       return <<<PHP
@@ -397,7 +419,7 @@ PHP;
     return <<<PHP
                 <div class="mb-4">
                     <label for="{$field}" class="block text-sm font-medium text-gray-700">{$label}</label>
-                    <{$inputType} name="{$field}" id="{$field}" {$inputAttributes} class="mt-1 block w-full rounded-md border-gray-300 shadow-sm">
+                    <{$inputType} name="{$field}" id="{$field}" {$inputAttributes} class="mt-1 block w-full rounded-md border-gray-300 shadow-sm" value="{$value}">
                     </{$inputType}>
                     @error('{$field}')
                         <p class="text-red-500 text-xs mt-1">{{ \$message }}</p>
@@ -406,11 +428,11 @@ PHP;
 PHP;
   }
 
-  protected function generateEditView($modelName, $fields)
+  protected function generateEditView($modelName, $fields, $viewsPath)
   {
     $formFields = '';
     foreach ($fields as $field => $type) {
-      $formFields .= $this->generateFormField($field, $type, true);
+      $formFields .= $this->generateFormField($field, $type, $modelName, true);
     }
 
     $content = <<<PHP
@@ -435,7 +457,7 @@ PHP;
     File::put("{$viewsPath}/edit.blade.php", $content);
   }
 
-  protected function generateShowView($modelName, $fields)
+  protected function generateShowView($modelName, $fields, $viewsPath)
   {
     $fieldsList = '';
     foreach ($fields as $field => $type) {
